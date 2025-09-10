@@ -1,0 +1,214 @@
+<!-- client.html -->
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <title>Tap Sprint</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            margin-top: 40px;
+        }
+
+        #status {
+            margin: 10px;
+        }
+
+        #count {
+            font-size: 48px;
+            margin: 20px;
+        }
+
+        button {
+            padding: 10px 16px;
+            font-size: 16px;
+            margin: 4px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>Tap Sprint</h1>
+    <div>
+        Room: <input id="room" value="room1"> Username: <input id="name" value="player1">
+        <button id="connect">Connect</button>
+    </div>
+
+    <div id="status">Not connected</div>
+    <div>
+        <button id="startBtn" disabled>Request Start (leader)</button>
+    </div>
+
+    <div id="count">0</div>
+    <div id="timer">Waiting...</div>
+    <div id="results"></div>
+
+    <script>
+        let ws = null;
+        let serverOffset = 0; // server_time - client_time
+        let startTime = null; // server epoch seconds
+        let duration = 15;
+        let running = false;
+        let localTaps = [];
+        let localCount = 0;
+
+        const statusEl = document.getElementById('status');
+        const countEl = document.getElementById('count');
+        const timerEl = document.getElementById('timer');
+        const resultsEl = document.getElementById('results');
+        const startBtn = document.getElementById('startBtn');
+
+        function now() { return Date.now() / 1000; } // seconds
+
+        document.getElementById('connect').onclick = () => {
+            const room = document.getElementById('room').value;
+            const name = document.getElementById('name').value;
+            const url = `ws://${location.hostname}:8000/ws/${room}/${encodeURIComponent(name)}`;
+            ws = new WebSocket(url);
+            ws.onopen = () => {
+                statusEl.textContent = 'Connected';
+                startBtn.disabled = false;
+                // join
+                ws.send(JSON.stringify({ type: 'join' }));
+                // perform timesync a few times and average
+                timesync().then(offset => {
+                    serverOffset = offset;
+                    statusEl.textContent = `Connected — estimated offset ${serverOffset.toFixed(3)}s`;
+                });
+            };
+            ws.onmessage = (ev) => {
+                const msg = JSON.parse(ev.data);
+                handleMessage(msg);
+            };
+            ws.onclose = () => { statusEl.textContent = 'Disconnected'; startBtn.disabled = true; };
+        };
+
+        async function timesync(rounds = 5) {
+            // estimate offset by doing several pings
+            const offsets = [];
+            for (let i = 0; i < rounds; i++) {
+                const t0 = now();
+                ws.send(JSON.stringify({ type: 'timesync', client_time: t0 }));
+                const resp = await waitForType('timesync_resp');
+                const t1 = now();
+                const server_time = resp.server_time;
+                const rtt = t1 - t0;
+                const estOffset = server_time - (t0 + rtt / 2.0);
+                offsets.push(estOffset);
+                await new Promise(res => setTimeout(res, 100));
+            }
+            // median is robust
+            offsets.sort((a, b) => a - b);
+            return offsets[Math.floor(offsets.length / 2)];
+        }
+
+        function waitForType(type) {
+            return new Promise(resolve => {
+                function handler(ev) {
+                    const msg = JSON.parse(ev.data);
+                    if (msg.type === type) {
+                        ws.removeEventListener('message', handler);
+                        resolve(msg);
+                    }
+                }
+                ws.addEventListener('message', handler);
+            });
+        }
+
+        startBtn.onclick = () => {
+            ws.send(JSON.stringify({ type: 'request_start' }));
+            statusEl.textContent = 'Requested start. Waiting for server...';
+        };
+
+        // Handle incoming server messages
+        function handleMessage(msg) {
+            if (msg.type === 'start') {
+                startTime = msg.start_time; // server epoch seconds
+                duration = msg.duration ?? 15;
+                scheduleStart();
+            } else if (msg.type === 'room_info') {
+                statusEl.textContent = `In room. Users: ${msg.users.join(', ')}`;
+            } else if (msg.type === 'presence') {
+                statusEl.textContent = `Users now: ${msg.users.join(', ')}`;
+            } else if (msg.type === 'partial_result') {
+                resultsEl.textContent = `Partial: ${msg.user} -> ${msg.validated}`;
+            } else if (msg.type === 'round_end') {
+                const ranking = msg.ranking;
+                resultsEl.innerHTML = '<h3>Results</h3>' + ranking.map(r => `<div>${r.user}: ${r.validated} (reported ${r.reported})</div>`).join('');
+                running = false;
+                timerEl.textContent = 'Round ended';
+            } else if (msg.type === 'timesync_resp') {
+                // handled in waitForType
+            }
+        }
+
+        function scheduleStart() {
+            // compute local start using offset: local = server_start - offset
+            const localStart = startTime - serverOffset;
+            const msUntil = Math.max(0, (localStart - now()) * 1000);
+            statusEl.textContent = `Start scheduled at server ${new Date(startTime * 1000).toISOString()}. local start in ${(msUntil / 1000).toFixed(2)}s`;
+            setTimeout(() => beginRound(startTime, duration), msUntil);
+        }
+
+        function beginRound(serverStart, durationSec) {
+            running = true;
+            localTaps = [];
+            localCount = 0;
+            countEl.textContent = localCount;
+            const endLocal = serverStart + durationSec - serverOffset;
+            // countdown updater
+            const tick = setInterval(() => {
+                const left = Math.max(0, endLocal - now());
+                timerEl.textContent = `Time left: ${left.toFixed(2)}s`;
+                if (left <= 0) {
+                    clearInterval(tick);
+                    // 🔥 Send final score to server
+                    ws.send(JSON.stringify({
+                        type: "score",
+                        score: localCount
+                    }));
+                    endRound();
+                }
+            }, 50);
+            // capture taps - space or click
+            window.addEventListener('keydown', tapHandler);
+            window.addEventListener('mousedown', tapHandlerMouse);
+        }
+
+        function tapHandler(e) {
+            if (!running) return;
+            if (e.code === 'Space') {
+                localCount += 1;
+                localTaps.push(now());
+                countEl.textContent = localCount;
+            }
+        }
+        function tapHandlerMouse(e) {
+            if (!running) return;
+            localCount += 1;
+            localTaps.push(now());
+            countEl.textContent = localCount;
+        }
+
+        function endRound() {
+            running = false;
+            window.removeEventListener('keydown', tapHandler);
+            window.removeEventListener('mousedown', tapHandlerMouse);
+            timerEl.textContent = 'Submitting...';
+            // send result: count, timestamps, offset
+            ws.send(JSON.stringify({
+                type: 'result',
+                count: localCount,
+                timestamps: localTaps,
+                offset: serverOffset
+            }));
+            timerEl.textContent = 'Submitted, waiting results...';
+        }
+    </script>
+
+</body>
+
+</html>
